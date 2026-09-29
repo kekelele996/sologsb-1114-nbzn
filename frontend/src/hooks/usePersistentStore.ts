@@ -1,23 +1,27 @@
 import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
-import type { Cave, Segment, Sketch, Station } from '@/types'
+import type { Cave, MergeRecord, Segment, Sketch, Station, SurveyBatch } from '@/types'
+import { nextBatchCode } from '@/types'
 import { computeHorizontal, computeVertical } from '@/utils/survey'
+import { uid } from '@/utils/id'
 
 /** IndexedDB 数据结构版本号（升级迁移时使用） */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 四张表 + 元数据表 */
+/** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 / 批次 / 拼合记录 六张表 + 元数据表 */
 class CaveSurveyDb extends Dexie {
   caves!: Table<Cave, string>
   segments!: Table<Segment, string>
   stations!: Table<Station, string>
   sketches!: Table<Sketch, string>
+  batches!: Table<SurveyBatch, string>
+  merges!: Table<MergeRecord, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -30,7 +34,7 @@ class CaveSurveyDb extends Dexie {
       meta: 'key'
     })
     // v2：旧版测点记录缺少水平距/垂距，迁移时由斜距 + 倾角补齐
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         caves: 'id, name, region, archived',
         segments: 'id, caveId, code, type',
@@ -50,6 +54,109 @@ class CaveSurveyDb extends Dexie {
               station.verticalDistance = computeVertical(station.dip, station.slopeDistance)
             }
           })
+      })
+    // v3：引入测量批次与按批次存档的拼合记录。
+    // 升级前留下的测点/草图按洞段各归到一个「可追溯的旧批」（已通过状态），
+    // 并把该旧批选为洞段当前参与拼合的批次；旧批草图的拼合顺序迁入拼合记录。
+    this.version(SCHEMA_VERSION)
+      .stores({
+        caves: 'id, name, region, archived',
+        segments: 'id, caveId, code, type',
+        stations: 'id, segmentId, batchId, code, date',
+        sketches: 'id, segmentId, batchId, code, mergeOrder',
+        batches: 'id, segmentId, code, status',
+        merges: 'batchId, segmentId',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const nowIso = new Date().toISOString()
+        const today = nowIso.slice(0, 10)
+        const stationTable = tx.table<Station, string>('stations')
+        const sketchTable = tx.table<Sketch, string>('sketches')
+        const segmentTable = tx.table<Segment, string>('segments')
+
+        const [segments, stations, sketches] = await Promise.all([
+          segmentTable.toArray(),
+          stationTable.toArray(),
+          sketchTable.toArray()
+        ])
+
+        // 升级事务内 batches / merges 表已按新 schema 建好，按名取用
+        const batchesTableV3 = tx.table<SurveyBatch, string>('batches')
+        const mergesTableV3 = tx.table<MergeRecord, string>('merges')
+
+        const legacyBatches: SurveyBatch[] = []
+        const legacyBatchBySegment = new Map<string, string>()
+
+        for (const segment of segments) {
+          const ownStations = stations.filter((station) => station.segmentId === segment.id)
+          const ownSketches = sketches.filter((sketch) => sketch.segmentId === segment.id)
+          if (ownStations.length === 0 && ownSketches.length === 0) {
+            // 没有历史读数的洞段不需要旧批
+            continue
+          }
+          const existingCodes = legacyBatches
+            .filter((batch) => batch.segmentId === segment.id)
+            .map((batch) => batch.code)
+          const batchId = uid('batch')
+          const code = nextBatchCode(segment.code, existingCodes, true)
+          const legacyBatch: SurveyBatch = {
+            id: batchId,
+            segmentId: segment.id,
+            code,
+            status: 'approved',
+            surveyor: '',
+            note: '系统升级前的历史测量数据，迁移时自动归集为本洞段的旧批。',
+            carriedReason: '',
+            forkedFromId: '',
+            legacy: true,
+            submittedAt: '',
+            reviewedAt: nowIso,
+            reviewer: '系统迁移',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            events: [
+              {
+                type: 'approve',
+                at: `${today} 系统升级`,
+                actor: '系统迁移',
+                note: '升级前历史数据自动归集为可追溯旧批'
+              }
+            ]
+          }
+          legacyBatches.push(legacyBatch)
+          legacyBatchBySegment.set(segment.id, batchId)
+
+          const orderedSketches = [...ownSketches].sort((a, b) => a.mergeOrder - b.mergeOrder)
+          if (orderedSketches.length > 0) {
+            await mergesTableV3.put({
+              batchId,
+              segmentId: segment.id,
+              updatedAt: nowIso,
+              items: orderedSketches.map((sketch, index) => ({
+                sketchId: sketch.id,
+                order: index + 1,
+                offset: 0,
+                snapped: false
+              }))
+            })
+          }
+        }
+
+        await batchesTableV3.bulkPut(legacyBatches)
+
+        await stationTable.toCollection().modify((station) => {
+          const batchId = legacyBatchBySegment.get(station.segmentId)
+          if (batchId) station.batchId = batchId
+        })
+        await sketchTable.toCollection().modify((sketch) => {
+          const batchId = legacyBatchBySegment.get(sketch.segmentId)
+          if (batchId) sketch.batchId = batchId
+        })
+        await segmentTable.toCollection().modify((segment) => {
+          const batchId = legacyBatchBySegment.get(segment.id)
+          if (batchId) segment.activeBatchId = batchId
+        })
       })
   }
 }
@@ -97,7 +204,8 @@ export function useStore<T extends object>(store: StoreApi<T>): T {
 
 /**
  * 首次打开时写入一套示例洞穴数据，保证各页面进入即有事可做。
- * 只在四张表都为空时执行一次。
+ * 只在洞穴表为空时执行一次。示例数据同样走「已通过批次」，
+ * 保证草图工作台与图幅拼合开箱即用。
  */
 export async function seedDemoData(): Promise<void> {
   const caveCount = await db.caves.count()
@@ -106,8 +214,11 @@ export async function seedDemoData(): Promise<void> {
   const caveId = 'cave_demo_001'
   const segmentA = 'seg_demo_001'
   const segmentB = 'seg_demo_002'
+  const batchA = 'batch_demo_001'
+  const batchB = 'batch_demo_002'
 
-  const today = new Date().toISOString().slice(0, 10)
+  const nowIso = new Date().toISOString()
+  const today = nowIso.slice(0, 10)
 
   await db.caves.put({
     id: caveId,
@@ -122,7 +233,7 @@ export async function seedDemoData(): Promise<void> {
     surveyor: '陆昀',
     climateNote: '洞内 16.2℃，相对湿度 94%，中段有滴水',
     archived: false,
-    createdAt: new Date().toISOString()
+    createdAt: nowIso
   })
 
   await db.segments.bulkPut([
@@ -137,6 +248,7 @@ export async function seedDemoData(): Promise<void> {
       avgHeight: 3.1,
       slopeTrend: '缓升 3°',
       closed: false,
+      activeBatchId: batchA,
       sketchNo: 'S-01'
     },
     {
@@ -150,7 +262,53 @@ export async function seedDemoData(): Promise<void> {
       avgHeight: 12.5,
       slopeTrend: '陡降 68°',
       closed: true,
+      activeBatchId: batchB,
       sketchNo: 'S-02'
+    }
+  ])
+
+  await db.batches.bulkPut([
+    {
+      id: batchA,
+      segmentId: segmentA,
+      code: 'C-01-B1',
+      status: 'approved',
+      surveyor: '陆昀',
+      note: '入口廊道首测，读数稳定。',
+      carriedReason: '',
+      forkedFromId: '',
+      legacy: false,
+      submittedAt: nowIso,
+      reviewedAt: nowIso,
+      reviewer: '复核员·韦岑',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      events: [
+        { type: 'create', at: nowIso, actor: '陆昀' },
+        { type: 'submit', at: nowIso, actor: '陆昀' },
+        { type: 'approve', at: nowIso, actor: '复核员·韦岑', note: '闭合差合格' }
+      ]
+    },
+    {
+      id: batchB,
+      segmentId: segmentB,
+      code: 'C-02-B1',
+      status: 'approved',
+      surveyor: '陆昀',
+      note: '竖井段首测。',
+      carriedReason: '',
+      forkedFromId: '',
+      legacy: false,
+      submittedAt: nowIso,
+      reviewedAt: nowIso,
+      reviewer: '复核员·韦岑',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      events: [
+        { type: 'create', at: nowIso, actor: '陆昀' },
+        { type: 'submit', at: nowIso, actor: '陆昀' },
+        { type: 'approve', at: nowIso, actor: '复核员·韦岑', note: '竖井剖面读数齐全' }
+      ]
     }
   ])
 
@@ -158,6 +316,7 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'st_demo_001',
       segmentId: segmentA,
+      batchId: batchA,
       code: 'P1',
       bearing: 118.5,
       dip: -2.5,
@@ -173,6 +332,7 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'st_demo_002',
       segmentId: segmentA,
+      batchId: batchA,
       code: 'P2',
       bearing: 121.2,
       dip: -1.8,
@@ -191,6 +351,7 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'sk_demo_001',
       segmentId: segmentA,
+      batchId: batchA,
       code: 'S-01',
       gridCount: 48,
       scale: 200,
@@ -202,13 +363,29 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'sk_demo_002',
       segmentId: segmentB,
+      batchId: batchB,
       code: 'S-02',
       gridCount: 30,
       scale: 200,
       author: '覃羽',
-      mergeOrder: 2,
+      mergeOrder: 1,
       anchorStake: 'K0+120',
       imageNote: '竖井剖面草图，标注三处锚点'
+    }
+  ])
+
+  await db.merges.bulkPut([
+    {
+      batchId: batchA,
+      segmentId: segmentA,
+      updatedAt: nowIso,
+      items: [{ sketchId: 'sk_demo_001', order: 1, offset: 0, snapped: false }]
+    },
+    {
+      batchId: batchB,
+      segmentId: segmentB,
+      updatedAt: nowIso,
+      items: [{ sketchId: 'sk_demo_002', order: 1, offset: 0, snapped: false }]
     }
   ])
 }

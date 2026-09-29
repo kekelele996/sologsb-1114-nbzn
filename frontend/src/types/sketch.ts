@@ -2,6 +2,8 @@
 export interface Sketch {
   id: string
   segmentId: string
+  /** 所属测量批次；只有「已通过」批次的草图才能进工作台与拼合 */
+  batchId: string
   /** 草图编号 */
   code: string
   /** 坐标纸格数 */
@@ -21,8 +23,22 @@ export interface Sketch {
 /** 图幅拼合对齐结果 */
 export interface MergeItem {
   sketchId: string
-  /** 对齐后的横向偏移（单位：格） */
+  /** 拼合顺序号（在所属批次内排序） */
+  order: number
+  /** 对齐后的横向偏移（单位：格/px） */
   offset: number
   /** 是否已吸附到锚点 */
   snapped: boolean
+}
+
+/**
+ * 拼合记录按批次单独存档：换批次时旧批的偏移/吸附/顺序不会和新批混在一起。
+ * 一个已通过批次对应一份 MergeRecord。
+ */
+export interface MergeRecord {
+  /** 即批次 id */
+  batchId: string
+  segmentId: string
+  items: MergeItem[]
+  updatedAt: string
 }

@@ -8,6 +8,8 @@ export interface SketchState {
   hydrate: () => Promise<void>
   save: (sketch: Sketch) => Promise<void>
   remove: (id: string) => Promise<void>
+  /** 删除某批次下全部草图（批次作废/洞段清理时使用） */
+  removeByBatch: (batchId: string) => Promise<void>
   reorder: (orderedIds: string[]) => Promise<void>
 }
 
@@ -25,6 +27,13 @@ export const sketchStore = createStore<SketchState>((set, get) => ({
   },
   remove: async (id) => {
     await syncDelete(db.sketches, id)
+    await get().hydrate()
+  },
+  removeByBatch: async (batchId) => {
+    const ids = get()
+      .sketches.filter((sketch) => sketch.batchId === batchId)
+      .map((sketch) => sketch.id)
+    await db.sketches.bulkDelete(ids)
     await get().hydrate()
   },
   reorder: async (orderedIds) => {

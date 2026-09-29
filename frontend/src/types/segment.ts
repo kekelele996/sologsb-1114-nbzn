@@ -30,6 +30,8 @@ export interface Segment {
   slopeTrend: string
   /** 是否已闭合 */
   closed: boolean
+  /** 当前选定参与图幅拼合的「已通过」批次 id（同一洞段同时只有一个） */
+  activeBatchId: string
   /** 草图序号 */
   sketchNo: string
 }

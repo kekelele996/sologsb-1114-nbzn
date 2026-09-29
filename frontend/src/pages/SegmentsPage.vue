@@ -8,12 +8,14 @@ import { useStore } from '@/hooks/usePersistentStore'
 import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
+import { sketchStore } from '@/stores/sketchStore'
 import { stakeRangeOverlap, stakeToNumber } from '@/utils/survey'
 import { uid } from '@/utils/id'
 
 const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
 const stationState = useStore(stationStore)
+const sketchState = useStore(sketchStore)
 
 const filterCaveId = ref<string>('')
 const filterType = ref<SegmentType | ''>('')
@@ -122,6 +124,7 @@ async function submit(): Promise<void> {
     avgHeight: Number(form.avgHeight) || 0,
     slopeTrend: form.slopeTrend.trim(),
     closed: form.closed,
+    activeBatchId: existing?.activeBatchId ?? '',
     sketchNo: form.sketchNo.trim()
   }
   await segmentStore.getState().save(segment)
@@ -148,9 +151,12 @@ async function applyBatchClosed(closed: boolean): Promise<void> {
 }
 
 async function removeSegment(segment: Segment): Promise<void> {
-  const count = stationCount(segment.id)
-  if (count > 0) {
-    ElMessage.error(`洞段「${segment.code}」下仍有 ${count} 个测点，请先清理`)
+  const countStations = stationCount(segment.id)
+  const sketchCount = sketchState.sketches.filter((sketch) => sketch.segmentId === segment.id).length
+  if (countStations > 0 || sketchCount > 0) {
+    ElMessage.error(
+      `洞段「${segment.code}」下仍有 ${countStations} 个测点、${sketchCount} 张草图，请先清理`
+    )
     return
   }
   await ElMessageBox.confirm(`确认删除洞段「${segment.code}」？`, '删除确认', { type: 'warning' })

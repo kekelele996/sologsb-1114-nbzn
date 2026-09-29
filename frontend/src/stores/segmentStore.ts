@@ -26,13 +26,26 @@ export const segmentStore = createStore<SegmentState>((set, get) => ({
     await get().hydrate()
   },
   remove: async (id) => {
-    await syncDelete<Segment>(db.segments, id)
+    // 洞段删除是物理清理：其下所有批次、测点、草图与按批存档的拼合记录一并删除。
+    // 业务页面会先拦截仍有数据的洞段，这里只保证不会留下孤儿记录。
+    const batches = await db.batches.where('segmentId').equals(id).primaryKeys()
+    await db.stations.where('segmentId').equals(id).delete()
+    await db.sketches.where('segmentId').equals(id).delete()
+    await db.merges.where('segmentId').equals(id).delete()
+    await db.batches.bulkDelete(batches)
+    await syncDelete(db.segments, id)
     await get().hydrate()
   },
   removeByCave: async (caveId) => {
-    const ids = get()
-      .segments.filter((item) => item.caveId === caveId)
-      .map((item) => item.id)
+    const segments = get().segments.filter((item) => item.caveId === caveId)
+    for (const segment of segments) {
+      const batches = await db.batches.where('segmentId').equals(segment.id).primaryKeys()
+      await db.stations.where('segmentId').equals(segment.id).delete()
+      await db.sketches.where('segmentId').equals(segment.id).delete()
+      await db.merges.where('segmentId').equals(segment.id).delete()
+      await db.batches.bulkDelete(batches)
+    }
+    const ids = segments.map((item) => item.id)
     await db.segments.bulkDelete(ids)
     await get().hydrate()
   },
