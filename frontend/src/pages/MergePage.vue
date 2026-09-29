@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Sketch } from '@/types'
 import ClosureBadge from '@/components/common/ClosureBadge.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
@@ -11,6 +11,7 @@ import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { sketchStore } from '@/stores/sketchStore'
+import { batchStore } from '@/stores/batchStore'
 import { downloadCsv } from '@/utils/export'
 import { stakeToNumber } from '@/utils/survey'
 
@@ -23,6 +24,7 @@ const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
 const stationState = useStore(stationStore)
 const sketchState = useStore(sketchStore)
+const batchState = useStore(batchStore)
 
 const selectedCaveId = ref<string>(caveState.caves[0]?.id ?? '')
 const draggingId = ref<string | null>(null)
@@ -30,6 +32,8 @@ const dragStartX = ref(0)
 const dragOriginOffset = ref(0)
 const snapLog = ref<string[]>([])
 
+/** 每个洞段当前参与拼合的批次（= segment.activeBatchId，切换即重置拼合记录） */
+const segmentBatchChoice = reactive<Record<string, string>>({})
 const offsets = reactive<Record<string, number>>({})
 const snapped = reactive<Record<string, boolean>>({})
 
@@ -37,9 +41,36 @@ const caveSegments = computed(() =>
   segmentState.segments.filter((segment) => !selectedCaveId.value || segment.caveId === selectedCaveId.value)
 )
 
+/** 洞段下可供拼合的批次：只有已通过批次 */
+function approvedBatchesOf(segmentId: string) {
+  return batchState.batches.filter((batch) => batch.segmentId === segmentId && batch.status === 'approved')
+}
+
+function batchCodeOf(batchId: string): string {
+  return batchState.batches.find((batch) => batch.id === batchId)?.code ?? ''
+}
+
+// 水合/切洞穴后把洞段的已选批次同步到本地选择表
+watch(
+  [caveSegments, () => batchState.batches.length],
+  () => {
+    caveSegments.value.forEach((segment) => {
+      if (segmentBatchChoice[segment.id] === undefined) {
+        segmentBatchChoice[segment.id] = segment.activeBatchId
+      }
+    })
+  },
+  { immediate: true, deep: true }
+)
+
+/** 实际参与拼合的草图：必须属于各洞段当前选中的已通过批次 */
+const activeBatchIds = computed(() =>
+  caveSegments.value.map((segment) => segmentBatchChoice[segment.id] ?? '').filter(Boolean)
+)
+
 const mergeSketches = computed<Sketch[]>(() =>
   sketchState.sketches
-    .filter((sketch) => caveSegments.value.some((segment) => segment.id === sketch.segmentId))
+    .filter((sketch) => activeBatchIds.value.includes(sketch.batchId))
     .sort((a, b) => a.mergeOrder - b.mergeOrder)
 )
 
@@ -67,9 +98,17 @@ watch(
   { immediate: true }
 )
 
+/** 拼合草图集合变化时：为新到草图初始化偏移；已不在集合里的旧批痕迹清掉，防止新旧记录相混 */
 watch(
   mergeSketches,
   (list) => {
+    const ids = new Set(list.map((sketch) => sketch.id))
+    Object.keys(offsets).forEach((id) => {
+      if (!ids.has(id)) delete offsets[id]
+    })
+    Object.keys(snapped).forEach((id) => {
+      if (!ids.has(id)) delete snapped[id]
+    })
     list.forEach((sketch) => {
       if (offsets[sketch.id] === undefined) offsets[sketch.id] = 0
       if (snapped[sketch.id] === undefined) snapped[sketch.id] = false
@@ -78,13 +117,38 @@ watch(
   { immediate: true }
 )
 
-/** 洞段测点闭合差（拼合视图复用闭合差徽标） */
+/** 洞段测点闭合差（只统计当前选中批次的测点） */
 const caveStations = computed(() =>
-  stationState.stations.filter((station) =>
-    caveSegments.value.some((segment) => segment.id === station.segmentId)
-  )
+  stationState.stations.filter((station) => activeBatchIds.value.includes(station.batchId))
 )
 const { result: closureResult } = useClosureCheck(caveStations)
+
+/** 切换洞段参与拼合的批次：原拼合记录作废，新批顺序重新初始化 */
+async function onBatchPick(segmentId: string, value: unknown): Promise<void> {
+  await chooseSegmentBatch(segmentId, String(value ?? ''))
+}
+
+/** 切换洞段参与拼合的批次（内部实现）：原拼合记录作废，新批顺序重新初始化 */
+async function chooseSegmentBatch(segmentId: string, batchId: string): Promise<void> {
+  const previous = segmentBatchChoice[segmentId]
+  if (previous === batchId) return
+  if (previous) {
+    try {
+      await ElMessageBox.confirm(
+        `洞段将改用批次 ${batchCodeOf(batchId) || '（空）'} 参与拼合，该洞段原有图幅的拖动偏移与吸附记录会清空，确认切换？`,
+        '切换拼合批次',
+        { type: 'warning', confirmButtonText: '切换并重置', cancelButtonText: '取消' }
+      )
+    } catch {
+      segmentBatchChoice[segmentId] = previous
+      return
+    }
+  }
+  await batchStore.getState().selectForMerge(segmentId, batchId)
+  segmentBatchChoice[segmentId] = batchId
+  snapLog.value = []
+  ElMessage.success(batchId ? `已改用批次 ${batchCodeOf(batchId)} 参与拼合` : '已取消该洞段参与拼合')
+}
 
 /** 按桩号锚点自动吸附：以最小锚点桩号为原点，按桩号差换算横向偏移 */
 function autoAlign(): void {
@@ -145,6 +209,7 @@ function onMouseUp(): void {
 interface MergeRow {
   order: number
   code: string
+  batch: string
   segment: string
   anchorStake: string
   offset: number
@@ -155,6 +220,7 @@ const mergeRows = computed<MergeRow[]>(() =>
   mergeSketches.value.map((sketch, index) => ({
     order: index + 1,
     code: sketch.code,
+    batch: batchCodeOf(sketch.batchId),
     segment: segmentOf(sketch),
     anchorStake: sketch.anchorStake,
     offset: offsets[sketch.id] ?? 0,
@@ -179,6 +245,7 @@ function exportMergeTable(): void {
     [
       { key: 'order', label: '拼合顺序' },
       { key: 'code', label: '草图编号' },
+      { key: 'batch', label: '来源批次' },
       { key: 'segment', label: '洞段' },
       { key: 'anchorStake', label: '锚点桩号' },
       { key: 'offset', label: '对齐偏移(px)' },
@@ -221,6 +288,38 @@ function exportMergeTable(): void {
         />
       </div>
     </div>
+
+    <el-card shadow="never" class="batch-pick-card">
+      <template #header>
+        <div class="batch-pick-head">
+          <span>各洞段参与拼合的已通过批次（同一洞段只能选一个）</span>
+          <span class="muted">切换批次会作废该洞段原有拼合记录并按新批重排</span>
+        </div>
+      </template>
+      <div class="batch-pick-grid">
+        <div v-for="segment in caveSegments" :key="segment.id" class="batch-pick-row">
+          <SegmentTag :type="segment.type" :code="segment.code" :closed="segment.closed" size="small" />
+          <el-select
+            :model-value="segmentBatchChoice[segment.id] ?? ''"
+            placeholder="选择已通过批次"
+            style="width: 240px"
+            @change="(value: unknown) => onBatchPick(segment.id, value)"
+          >
+            <el-option label="不参与拼合" :value="''" />
+            <el-option
+              v-for="batch in approvedBatchesOf(segment.id)"
+              :key="batch.id"
+              :label="`${batch.code} · 已通过${batch.legacy ? '（旧批）' : ''}`"
+              :value="batch.id"
+            />
+          </el-select>
+          <span v-if="!(segmentBatchChoice[segment.id])" class="muted">
+            该洞段无已通过批次时，请先到「测点读数」完成复核
+          </span>
+        </div>
+        <span v-if="caveSegments.length === 0" class="muted">当前洞穴还没有洞段。</span>
+      </div>
+    </el-card>
 
     <div class="merge-row">
       <div class="canvas-wrap" @mousemove="onMouseMove" @mouseup="onMouseUp" @mouseleave="onMouseUp">
@@ -267,12 +366,12 @@ function exportMergeTable(): void {
         </g>
         <text
           v-if="mergeSketches.length === 0"
-          :x="CANVAS_W / 2 - 110"
+          :x="CANVAS_W / 2 - 150"
           :y="CANVAS_H / 2"
           font-size="13"
           fill="#8a97a3"
         >
-          该洞穴暂无草图图幅，请先到「草图工作台」建立
+          尚未选择任何已通过批次，请先在下方为洞段指定参与拼合的批次
         </text>
         <template #legend>
           <span>拖动图幅可移动</span>
@@ -305,7 +404,8 @@ function exportMergeTable(): void {
     <el-table :data="mergeRows" border stripe>
       <el-table-column prop="order" label="拼合顺序" width="100" />
       <el-table-column prop="code" label="草图编号" width="120" />
-      <el-table-column prop="segment" label="洞段" width="120" />
+      <el-table-column prop="batch" label="来源批次" width="110" />
+      <el-table-column prop="segment" label="洞段" width="110" />
       <el-table-column prop="anchorStake" label="桩号对齐锚点" width="150" />
       <el-table-column label="对齐偏移" width="120">
         <template #default="{ row }: { row: MergeRow }">{{ row.offset }} px</template>
@@ -344,6 +444,25 @@ function exportMergeTable(): void {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+.batch-pick-card {
+  border-radius: 12px;
+  margin-bottom: 14px;
+}
+.batch-pick-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.batch-pick-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.batch-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 .canvas-wrap {
   display: inline-flex;

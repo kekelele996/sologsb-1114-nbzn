@@ -2,6 +2,8 @@
 export interface Station {
   id: string
   segmentId: string
+  /** 所属测量批次（读数随批次冻结） */
+  batchId: string
   /** 测点桩号，如 P12 */
   code: string
   /** 前视方位角（十进制度，0-360） */

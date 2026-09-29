@@ -9,6 +9,7 @@ export interface SegmentState {
   save: (segment: Segment) => Promise<void>
   remove: (id: string) => Promise<void>
   removeByCave: (caveId: string) => Promise<void>
+  setActiveBatch: (segmentId: string, batchId: string) => Promise<void>
   bulkSetType: (ids: string[], type: SegmentType) => Promise<void>
   bulkSetClosed: (ids: string[], closed: boolean) => Promise<void>
 }
@@ -34,6 +35,12 @@ export const segmentStore = createStore<SegmentState>((set, get) => ({
       .segments.filter((item) => item.caveId === caveId)
       .map((item) => item.id)
     await db.segments.bulkDelete(ids)
+    await get().hydrate()
+  },
+  setActiveBatch: async (segmentId, batchId) => {
+    const target = get().segments.find((item) => item.id === segmentId)
+    if (!target) return
+    await syncPut<Segment>(db.segments, { ...target, activeBatchId: batchId })
     await get().hydrate()
   },
   bulkSetType: async (ids, type) => {

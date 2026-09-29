@@ -1,23 +1,24 @@
 import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
-import type { Cave, Segment, Sketch, Station } from '@/types'
+import type { Cave, Segment, Sketch, Station, SurveyBatch } from '@/types'
 import { computeHorizontal, computeVertical } from '@/utils/survey'
 
 /** IndexedDB 数据结构版本号（升级迁移时使用） */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 四张表 + 元数据表 */
+/** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 / 测量批次 五张表 + 元数据表 */
 class CaveSurveyDb extends Dexie {
   caves!: Table<Cave, string>
   segments!: Table<Segment, string>
   stations!: Table<Station, string>
   sketches!: Table<Sketch, string>
+  surveyBatches!: Table<SurveyBatch, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -50,6 +51,69 @@ class CaveSurveyDb extends Dexie {
               station.verticalDistance = computeVertical(station.dip, station.slopeDistance)
             }
           })
+      })
+    // v3：引入测量批次。旧版测点/草图按洞段归并到一个「已通过」旧批，
+    // 保持草图与拼合功能可用，批次 legacy 标记可追溯其升级来源。
+    this.version(SCHEMA_VERSION)
+      .stores({
+        caves: 'id, name, region, archived',
+        segments: 'id, caveId, code, type, activeBatchId',
+        stations: 'id, segmentId, batchId, code, date',
+        sketches: 'id, segmentId, batchId, code, mergeOrder',
+        surveyBatches: 'id, segmentId, status, code',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const stationsTable = tx.table<Station, string>('stations')
+        const sketchesTable = tx.table<Sketch, string>('sketches')
+        const segmentsTable = tx.table<Segment, string>('segments')
+        const batchesTable = tx.table<SurveyBatch, string>('surveyBatches')
+
+        const [stations, sketches] = await Promise.all([
+          stationsTable.toArray(),
+          sketchesTable.toArray()
+        ])
+
+        // 归并键：以数据所属洞段为准（即使洞段记录已缺失也不丢数据）
+        const segmentIds = new Set<string>()
+        stations.forEach((station) => segmentIds.add(station.segmentId))
+        sketches.forEach((sketch) => segmentIds.add(sketch.segmentId))
+
+        const now = new Date().toISOString()
+        const legacyBySegment = new Map<string, string>()
+
+        for (const segmentId of segmentIds) {
+          const batchId = `batch_legacy_${segmentId}`
+          legacyBySegment.set(segmentId, batchId)
+          await batchesTable.put({
+            id: batchId,
+            segmentId,
+            code: 'B-OLD',
+            status: 'approved',
+            submittedBy: '',
+            submittedAt: '',
+            reviewedBy: '系统升级',
+            reviewedAt: now,
+            rejectReason: '',
+            carriedReason: '',
+            originBatchId: '',
+            legacy: true,
+            createdAt: now,
+            updatedAt: now
+          })
+        }
+
+        await stationsTable.toCollection().modify((station) => {
+          if (!station.batchId) station.batchId = legacyBySegment.get(station.segmentId) ?? ''
+        })
+        await sketchesTable.toCollection().modify((sketch) => {
+          if (!sketch.batchId) sketch.batchId = legacyBySegment.get(sketch.segmentId) ?? ''
+        })
+        await segmentsTable.toCollection().modify((segment) => {
+          if (segment.activeBatchId === undefined) segment.activeBatchId = ''
+          const legacyId = legacyBySegment.get(segment.id)
+          if (legacyId) segment.activeBatchId = legacyId
+        })
       })
   }
 }
@@ -107,7 +171,13 @@ export async function seedDemoData(): Promise<void> {
   const segmentA = 'seg_demo_001'
   const segmentB = 'seg_demo_002'
 
+  const batchApprovedA = 'batch_demo_001'
+  const batchRejectedA = 'batch_demo_002'
+  const batchDraftA = 'batch_demo_003'
+  const batchReviewingB = 'batch_demo_004'
+
   const today = new Date().toISOString().slice(0, 10)
+  const now = new Date().toISOString()
 
   await db.caves.put({
     id: caveId,
@@ -122,7 +192,7 @@ export async function seedDemoData(): Promise<void> {
     surveyor: '陆昀',
     climateNote: '洞内 16.2℃，相对湿度 94%，中段有滴水',
     archived: false,
-    createdAt: new Date().toISOString()
+    createdAt: now
   })
 
   await db.segments.bulkPut([
@@ -137,7 +207,8 @@ export async function seedDemoData(): Promise<void> {
       avgHeight: 3.1,
       slopeTrend: '缓升 3°',
       closed: false,
-      sketchNo: 'S-01'
+      sketchNo: 'S-01',
+      activeBatchId: batchApprovedA
     },
     {
       id: segmentB,
@@ -150,7 +221,75 @@ export async function seedDemoData(): Promise<void> {
       avgHeight: 12.5,
       slopeTrend: '陡降 68°',
       closed: true,
-      sketchNo: 'S-02'
+      sketchNo: 'S-02',
+      activeBatchId: ''
+    }
+  ])
+
+  await db.surveyBatches.bulkPut([
+    {
+      id: batchApprovedA,
+      segmentId: segmentA,
+      code: 'B-01',
+      status: 'approved',
+      submittedBy: '陆昀',
+      submittedAt: now,
+      reviewedBy: '何鉴',
+      reviewedAt: now,
+      rejectReason: '',
+      carriedReason: '',
+      originBatchId: '',
+      legacy: false,
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: batchRejectedA,
+      segmentId: segmentA,
+      code: 'B-02',
+      status: 'rejected',
+      submittedBy: '陆昀',
+      submittedAt: now,
+      reviewedBy: '何鉴',
+      reviewedAt: now,
+      rejectReason: 'P2 斜距与皮尺复量相差 0.6 m，且末站闭合点未与 C-02 起点对桩，请复测后重新提交。',
+      carriedReason: '',
+      originBatchId: '',
+      legacy: false,
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: batchDraftA,
+      segmentId: segmentA,
+      code: 'B-03',
+      status: 'draft',
+      submittedBy: '',
+      submittedAt: '',
+      reviewedBy: '',
+      reviewedAt: '',
+      rejectReason: '',
+      carriedReason: 'P2 斜距与皮尺复量相差 0.6 m，且末站闭合点未与 C-02 起点对桩，请复测后重新提交。',
+      originBatchId: batchRejectedA,
+      legacy: false,
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: batchReviewingB,
+      segmentId: segmentB,
+      code: 'B-01',
+      status: 'reviewing',
+      submittedBy: '覃羽',
+      submittedAt: now,
+      reviewedBy: '',
+      reviewedAt: '',
+      rejectReason: '',
+      carriedReason: '',
+      originBatchId: '',
+      legacy: false,
+      createdAt: now,
+      updatedAt: now
     }
   ])
 
@@ -158,6 +297,7 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'st_demo_001',
       segmentId: segmentA,
+      batchId: batchApprovedA,
       code: 'P1',
       bearing: 118.5,
       dip: -2.5,
@@ -173,6 +313,7 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'st_demo_002',
       segmentId: segmentA,
+      batchId: batchApprovedA,
       code: 'P2',
       bearing: 121.2,
       dip: -1.8,
@@ -184,6 +325,38 @@ export async function seedDemoData(): Promise<void> {
       date: today,
       isClosurePoint: true,
       note: '本段末站，已与 C-02 起点核对'
+    },
+    {
+      id: 'st_demo_003',
+      segmentId: segmentA,
+      batchId: batchRejectedA,
+      code: 'P2',
+      bearing: 121.2,
+      dip: -1.8,
+      slopeDistance: 16.4,
+      horizontalDistance: computeHorizontal(-1.8, 16.4),
+      verticalDistance: computeVertical(-1.8, 16.4),
+      instrumentNo: 'SOKKIA-2',
+      surveyor: '陆昀',
+      date: today,
+      isClosurePoint: true,
+      note: '原记录读数，斜距疑似偏大'
+    },
+    {
+      id: 'st_demo_004',
+      segmentId: segmentB,
+      batchId: batchReviewingB,
+      code: 'P1',
+      bearing: 126.0,
+      dip: -68.0,
+      slopeDistance: 22.3,
+      horizontalDistance: computeHorizontal(-68.0, 22.3),
+      verticalDistance: computeVertical(-68.0, 22.3),
+      instrumentNo: 'SOKKIA-2',
+      surveyor: '覃羽',
+      date: today,
+      isClosurePoint: false,
+      note: '竖井口第一测站，垂绳量深'
     }
   ])
 
@@ -191,6 +364,7 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'sk_demo_001',
       segmentId: segmentA,
+      batchId: batchApprovedA,
       code: 'S-01',
       gridCount: 48,
       scale: 200,
@@ -202,13 +376,14 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'sk_demo_002',
       segmentId: segmentB,
+      batchId: batchReviewingB,
       code: 'S-02',
       gridCount: 30,
       scale: 200,
       author: '覃羽',
       mergeOrder: 2,
       anchorStake: 'K0+120',
-      imageNote: '竖井剖面草图，标注三处锚点'
+      imageNote: '竖井剖面草图，标注三处锚点（待复核批次，暂不可拼合）'
     }
   ])
 }

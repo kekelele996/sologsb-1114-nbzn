@@ -8,12 +8,14 @@ import { useStore } from '@/hooks/usePersistentStore'
 import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
+import { batchStore } from '@/stores/batchStore'
 import { stakeRangeOverlap, stakeToNumber } from '@/utils/survey'
 import { uid } from '@/utils/id'
 
 const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
 const stationState = useStore(stationStore)
+const batchState = useStore(batchStore)
 
 const filterCaveId = ref<string>('')
 const filterType = ref<SegmentType | ''>('')
@@ -122,7 +124,8 @@ async function submit(): Promise<void> {
     avgHeight: Number(form.avgHeight) || 0,
     slopeTrend: form.slopeTrend.trim(),
     closed: form.closed,
-    sketchNo: form.sketchNo.trim()
+    sketchNo: form.sketchNo.trim(),
+    activeBatchId: existing?.activeBatchId ?? ''
   }
   await segmentStore.getState().save(segment)
   dialogVisible.value = false
@@ -149,6 +152,11 @@ async function applyBatchClosed(closed: boolean): Promise<void> {
 
 async function removeSegment(segment: Segment): Promise<void> {
   const count = stationCount(segment.id)
+  const batchCount = batchState.batches.filter((batch) => batch.segmentId === segment.id).length
+  if (batchCount > 0) {
+    ElMessage.error(`洞段「${segment.code}」下仍有 ${batchCount} 个测量批次（含 ${count} 条读数），请先清理`)
+    return
+  }
   if (count > 0) {
     ElMessage.error(`洞段「${segment.code}」下仍有 ${count} 个测点，请先清理`)
     return

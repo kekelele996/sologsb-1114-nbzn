@@ -32,6 +32,8 @@ export interface Segment {
   closed: boolean
   /** 草图序号 */
   sketchNo: string
+  /** 当前参与图幅拼合的已通过批次；同一洞段同时只允许一个 */
+  activeBatchId: string
 }
 
 /** 洞段长度 = 起止桩号之差（米） */

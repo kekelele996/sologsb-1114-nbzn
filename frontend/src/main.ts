@@ -10,6 +10,7 @@ import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { sketchStore } from '@/stores/sketchStore'
+import { batchStore } from '@/stores/batchStore'
 import '@/styles/main.css'
 
 async function bootstrap(): Promise<void> {
@@ -17,6 +18,7 @@ async function bootstrap(): Promise<void> {
   await stampDbVersion()
   await caveStore.getState().hydrate()
   await segmentStore.getState().hydrate()
+  await batchStore.getState().hydrate()
   await stationStore.getState().hydrate()
   await sketchStore.getState().hydrate()
 }

@@ -2,6 +2,8 @@
 export interface Sketch {
   id: string
   segmentId: string
+  /** 所属测量批次；只有已通过批次下的草图才能参与拼合 */
+  batchId: string
   /** 草图编号 */
   code: string
   /** 坐标纸格数 */
